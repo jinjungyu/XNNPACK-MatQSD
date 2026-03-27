@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <cstdio>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -1938,6 +1939,32 @@ void xnn_pack_qb4_weights_and_biases(
         /*extra_bytes_n=*/nr * extra_bytes_n,
         /*params*/ (const struct xnn_qs8_qc4w_packing_params*)params);
     if (has_fast_packing_ukernel) {
+      // Dump first NR-block of packed data for debugging
+      {static int qb4_dump=0; if(qb4_dump<2){
+        const uint8_t* p=(const uint8_t*)packed_weights_ptr;
+        // vksum (16 floats = 64 bytes), then weight data, then scale
+        fprintf(stderr,"[qb4-pack-dump] oc=%zu ic=%zu bs=%zu dump#%d\n",
+                output_channels, input_channels, block_size, qb4_dump);
+        // vksum (first 16 bytes = 4 floats)
+        float vk[4]; memcpy(vk,p,16);
+        fprintf(stderr,"  vksum[0..3]=%.6f,%.6f,%.6f,%.6f\n",vk[0],vk[1],vk[2],vk[3]);
+        // Weight bytes at offset 64 (after 16 floats of vksum)
+        fprintf(stderr,"  w@64: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+                p[64],p[65],p[66],p[67],p[68],p[69],p[70],p[71]);
+        // Scale: after weight data for first block.
+        // block_size=128 nibbles → 64 bytes per OC → 64*16 = 1024 bytes for nr=16
+        // scale offset = 64 (vksum) + 1024 (weights) = 1088
+        size_t scale_off = 64 + (block_size/2)*nr;
+        fprintf(stderr,"  scale@%zu: %02x%02x %02x%02x %02x%02x %02x%02x\n",
+                scale_off, p[scale_off+1],p[scale_off],p[scale_off+3],p[scale_off+2],
+                p[scale_off+5],p[scale_off+4],p[scale_off+7],p[scale_off+6]);
+        // Convert first scale to float
+        uint16_t sbf16; memcpy(&sbf16,p+scale_off,2);
+        uint32_t sf32=(uint32_t)sbf16<<16; float sv;
+        memcpy(&sv,&sf32,sizeof(float));
+        fprintf(stderr,"  scale[0] bf16=0x%04x float=%.8f\n",sbf16,sv);
+        qb4_dump++;
+      }}
       // Fast Packing UKernel initializes scales and bias, so can early exit
       return;
     }
@@ -1965,6 +1992,249 @@ void xnn_pack_qb4_weights_and_biases(
     xnn_init_qs8_qc8w_scale_fp32_params(
         output_channels, gemm_config->nr, gemm_config->nr * weights_stride,
         (const float*)accumulator_init, weights_start);
+  }
+}
+
+// MatQSD mqint8: single weight, dual-mode packed format.
+//
+// .pte stores int8 [oc, ic]. Packer extracts upper/lower nibbles, converts
+// to qb4w nibble-pair format, and calls qb4w packer for each → guaranteed
+// correct tiling for qb4w kernel compatibility.
+//
+// Packed: [upper_tiled | lower_tiled] per NR-block.
+// 4-bit mode: read upper_tiled only (qb4w speed, half bandwidth)
+// 8-bit mode: read both, reconstruct full int8 in-register
+//
+// Per-OC stride = 2 × qb4w_single_stride.
+
+// Must match kernel's MQINT8_ROUND_REVERSAL setting
+#define MQINT8_ROUND_REVERSAL
+
+// Helper: bf16 → float32
+static inline float mqint8_bf16_to_f32(uint16_t bf16) {
+  uint32_t f32 = (uint32_t)bf16 << 16;
+  float result;
+  memcpy(&result, &f32, sizeof(float));
+  return result;
+}
+// Helper: float32 → bf16 (truncate)
+static inline uint16_t mqint8_f32_to_bf16(float f) {
+  uint32_t fbits;
+  memcpy(&fbits, &f, sizeof(uint32_t));
+  return (uint16_t)(fbits >> 16);
+}
+
+// MatQSD mqint8 packed stride: per-group interleaved [lower|upper|scale].
+//
+// Per-OC layout:
+//   vksum_4bit(4B) + vksum_8bit(4B)
+//   + num_groups × (lower_nib(GS/2) + upper_nib(GS/2) + scale(2B))
+//   + bias(4B)
+//
+// k_stride = round_up_po2(ic, kr*sr*planes) >> 1 (nibble-halved, from framework)
+size_t xnn_packed_stride_mqint8_weights_and_biases(
+    const struct xnn_gemm_config* gemm_config, size_t k, size_t block_size,
+    size_t k_stride, size_t extra_bytes) {
+  const size_t num_groups = (block_size != 0) ? (k / block_size) : 0;
+  const size_t bs_halved = block_size / 2;
+  // 4-bit region per OC: vksum4 + G*(upper+scale) + bias
+  const size_t four_bit_per_oc = sizeof(float) + num_groups * (bs_halved + sizeof(uint16_t)) + sizeof(float);
+  // 8-bit extra region per OC: vksum8 + G*lower
+  const size_t lower_per_oc = sizeof(float) + num_groups * bs_halved;
+  // Total for allocation (4-bit + lower)
+  return four_bit_per_oc + lower_per_oc;
+}
+
+// MatQSD mqint8 packer: per-group interleaved [lower|upper|scale].
+//
+// Input weight [oc, ic] bytes from .pte:
+//   Per OC row: [upper_nibble_pairs(ic/2 bytes) | lower_nibble_pairs(ic/2 bytes)]
+//   Each nibble-pair byte: (nib[k+1] << 4) | nib[k], unsigned [0,15]
+//
+// Output per NR-block:
+//   [vksum_4bit × NR] [vksum_8bit × NR]
+//   For each group:
+//     [lower tiled: packed2planar format, NR × GS/2 bytes]
+//     [upper tiled: packed2planar format, NR × GS/2 bytes]
+//     [scale: bf16 × NR]
+//   [bias: float32 × NR]
+
+// Helper: extract nibble at k-position from nibble-pair bytes
+static inline uint8_t mqint8_get_nib(const uint8_t* pair_base, size_t k) {
+  uint8_t byte = pair_base[k / 2];
+  return (k % 2 == 0) ? (byte & 0x0F) : (byte >> 4);
+}
+
+// Helper: tile one nibble region (upper or lower) for one group
+// Supports c4 (kr=4, cols_per_tile=4) and c8 (kr=8, cols_per_tile=2)
+static void mqint8_tile_nibble_region(
+    uint8_t** out_ptr, const uint8_t* w_bytes,
+    size_t row_stride, size_t nib_offset,
+    size_t g_start, size_t bs, size_t ic,
+    size_t nr_block, uint32_t nr, size_t oc,
+    uint32_t kr) {
+  uint8_t* out = *out_ptr;
+  const uint32_t cols_per_tile = 16 / kr;  // 4 for c4, 2 for c8
+  const size_t k_step = 2 * kr;            // 8 for c4, 16 for c8
+  for (size_t k_base = g_start; k_base < g_start + bs; k_base += k_step) {
+    for (uint32_t oc_sub = 0; oc_sub < nr; oc_sub += cols_per_tile) {
+      for (uint32_t oc_off = 0; oc_off < cols_per_tile; oc_off++) {
+        const size_t o = nr_block + oc_sub + oc_off;
+        const uint8_t* row = (o < oc) ? (w_bytes + o * row_stride + nib_offset) : NULL;
+        for (uint32_t ki = 0; ki < kr; ki++) {
+          uint8_t nib_lo = 8, nib_hi = 8;  // default = zp (XOR→0)
+          if (row) {
+            if (k_base + ki < ic)
+              nib_lo = mqint8_get_nib(row, k_base + ki);
+            if (k_base + ki + kr < ic)
+              nib_hi = mqint8_get_nib(row, k_base + ki + kr);
+          }
+          *out++ = ((nib_lo ^ 8) & 0x0F) | (((nib_hi ^ 8) & 0x0F) << 4);
+        }
+      }
+    }
+  }
+  *out_ptr = out;
+}
+
+void xnn_pack_mqint8_weights_and_biases(
+    uint32_t flags, const struct xnn_gemm_config* gemm_config,
+    size_t input_channels, size_t output_channels, size_t groups,
+    size_t block_size, size_t k_stride, const void* accumulator_init,
+    const void* weights, xnn_init_scale_params_fn init_extra_data0_fn,
+    const void* extra_data0, size_t extra_data0_element_size,
+    xnn_init_scale_params_fn init_extra_data1_fn, const void* extra_data1,
+    size_t extra_data1_element_size, void* packed_weights_ptr,
+    const void* params) {
+  const uint32_t nr = gemm_config->nr;
+  const size_t ic = input_channels;
+  const size_t oc = output_channels;
+  const size_t bs = (block_size > 0) ? block_size : ic;
+  const size_t num_groups = ic / bs;
+
+  // Weight layout from .pte (after convert_to_mqint8 in serializer):
+  //   Per OC row [ic bytes]: [upper_pairs(ic/2) | lower_pairs(ic/2)]
+  //   Each nibble-pair byte: (nib[k+1] << 4) | nib[k], unsigned [0,15]
+  //   Row stride = ic bytes
+  const uint8_t* w_bytes = (const uint8_t*)weights;
+  const size_t row_stride = ic;  // bytes per OC row
+
+  const float* bias_data = (const float*)accumulator_init;
+  const uint16_t* scales_bf16 = (const uint16_t*)extra_data1;
+
+  const size_t n_stride = round_up(oc, nr);
+  const uint32_t kr = UINT32_C(1) << gemm_config->log2_kr;
+
+  // Compute per-NR-block sizes
+  const size_t upper_per_group = (bs / 2) * nr;  // upper tiled bytes
+  const size_t scale_per_group = nr * sizeof(uint16_t);  // scale bytes
+  const size_t lower_per_group = upper_per_group;  // same size as upper
+  const size_t vksum4_size = nr * sizeof(float);  // vksum_4bit only
+  const size_t vksum8_size = nr * sizeof(float);  // vksum_8bit (goes to lower region)
+  const size_t bias_size = nr * sizeof(float);
+  const size_t four_bit_stride = vksum4_size
+      + num_groups * (upper_per_group + scale_per_group)
+      + bias_size;
+  const size_t lower_per_nr = vksum8_size + num_groups * lower_per_group;
+
+  // Two-pass packing for global region separation:
+  //   Pass 1: [NR0_4bit][NR1_4bit]...[NRn_4bit]  (all contiguous for 4-bit mode)
+  //   Pass 2: [NR0_lower][NR1_lower]...[NRn_lower]  (only read by 8-bit mode)
+  //
+  // Per NR 4-bit block: [vksum4|vksum8|{upper|scale}×G|bias]
+  // Per NR lower block: [{lower}×G]
+
+  const size_t num_nr_blocks = n_stride / nr;
+  uint8_t* out_4bit = (uint8_t*)packed_weights_ptr;
+  uint8_t* out_lower = (uint8_t*)packed_weights_ptr + num_nr_blocks * four_bit_stride;
+
+  for (size_t nr_block = 0; nr_block < n_stride; nr_block += nr) {
+    uint8_t* out = out_4bit;
+
+    // === 4-bit region: [vksum4 | {upper|scale}×G | bias] ===
+
+    // vksum_4bit
+    for (uint32_t i = 0; i < nr; i++) {
+      const size_t o = nr_block + i;
+      float vk4 = 0.0f;
+      if (o < oc && scales_bf16) {
+        const uint8_t* upper_row = w_bytes + o * row_stride;
+        for (size_t g = 0; g < num_groups; g++) {
+          int32_t sum_nib_shifted = 0;
+          for (size_t k = g * bs; k < (g + 1) * bs && k < ic; k++) {
+            uint8_t nib = mqint8_get_nib(upper_row, k);
+            sum_nib_shifted += (int32_t)((int8_t)((uint8_t)((nib ^ 8) << 4)));
+          }
+          float scale_8bit = mqint8_bf16_to_f32(scales_bf16[o * num_groups + g]);
+          vk4 -= scale_8bit * (float)sum_nib_shifted;
+        }
+      }
+      ((float*)out)[i] = vk4;
+    }
+    out += nr * sizeof(float);
+
+    // upper + scale per group
+    for (size_t g = 0; g < num_groups; g++) {
+      const size_t g_start = g * bs;
+      mqint8_tile_nibble_region(&out, w_bytes, row_stride, 0,
+          g_start, bs, ic, nr_block, nr, oc, kr);
+      for (uint32_t i = 0; i < nr; i++) {
+        const size_t o = nr_block + i;
+        uint16_t s = 0;
+        if (o < oc && scales_bf16) {
+          float orig = mqint8_bf16_to_f32(scales_bf16[o * num_groups + g]);
+          s = mqint8_f32_to_bf16(orig / 16.0f);
+        }
+        memcpy(out, &s, sizeof(uint16_t));
+        out += sizeof(uint16_t);
+      }
+    }
+
+    // bias
+    for (uint32_t i = 0; i < nr; i++) {
+      const size_t o = nr_block + i;
+      float b = (o < oc && bias_data) ? bias_data[o] : 0.0f;
+      memcpy(out, &b, sizeof(float));
+      out += sizeof(float);
+    }
+
+    out_4bit += four_bit_stride;
+
+    // === 8-bit extra region: [vksum8 | {lower}×G] ===
+
+    // vksum_8bit
+    for (uint32_t i = 0; i < nr; i++) {
+      const size_t o = nr_block + i;
+      float vk8 = 0.0f;
+      if (o < oc && scales_bf16) {
+        const uint8_t* upper_row = w_bytes + o * row_stride;
+        const uint8_t* lower_row = w_bytes + o * row_stride + ic / 2;
+        for (size_t g = 0; g < num_groups; g++) {
+          int32_t sum_full = 0;
+          for (size_t k = g * bs; k < (g + 1) * bs && k < ic; k++) {
+            uint8_t u = mqint8_get_nib(upper_row, k);
+            uint8_t l = mqint8_get_nib(lower_row, k);
+            int32_t full = (int32_t)u * 16 + (int32_t)l - 128;
+#ifdef MQINT8_ROUND_REVERSAL
+            int32_t round_bit = (l >= 8) ? 1 : 0;
+            full -= round_bit * 16;
+#endif
+            sum_full += full;
+          }
+          float scale_8bit = mqint8_bf16_to_f32(scales_bf16[o * num_groups + g]);
+          vk8 -= scale_8bit * (float)sum_full;
+        }
+      }
+      ((float*)out_lower)[i] = vk8;
+    }
+    out_lower += nr * sizeof(float);
+
+    // lower tiles per group
+    for (size_t g = 0; g < num_groups; g++) {
+      const size_t g_start = g * bs;
+      mqint8_tile_nibble_region(&out_lower, w_bytes, row_stride, ic / 2,
+          g_start, bs, ic, nr_block, nr, oc, kr);
+    }
   }
 }
 

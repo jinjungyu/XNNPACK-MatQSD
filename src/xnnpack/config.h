@@ -372,6 +372,7 @@ XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f16_qb4w_gemm_config();
 XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f16_qc4w_gemm_config();
 XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f16_qc8w_gemm_config();
 XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f16_qc8w_igemm_config();
+XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f32_mqint8_gemm_config();
 XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f32_qb4w_gemm_config();
 XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f32_qc4w_gemm_config();
 XNN_INTERNAL const struct xnn_gemm_config* xnn_init_qd8_f32_qc8w_gemm_config();

@@ -303,6 +303,9 @@ enum xnn_datatype {
   /// Packed quantized 8-bit unsigned integer with shared per-Value quantization
   /// parameters.
   xnn_datatype_pqint8 = 17,
+  /// MatQSD blocked int8: [upper_nibble_packed | lower_nibble_packed] per layer.
+  /// 8-bit weight reconstructed from two 4-bit nibbles with rounding correction.
+  xnn_datatype_mqint8 = 18,
 };
 
 /// Define a tensor-type Value and add it to a Subgraph.
@@ -4072,6 +4075,22 @@ enum xnn_status xnn_create_fully_connected_nc_qd8_f32_qb4w(
   xnn_weights_cache_t weights_cache,
   xnn_operator_t* fully_connected_op_out);
 
+enum xnn_status xnn_create_fully_connected_nc_qd8_f32_mqint8(
+  size_t input_channels,
+  size_t output_channels,
+  size_t input_stride,
+  size_t output_stride,
+  size_t block_size,
+  uint8_t kernel_zero_point,
+  const uint16_t* kernel_scale,
+  const void* kernel,
+  const float* bias,
+  float output_min,
+  float output_max,
+  uint32_t flags,
+  xnn_weights_cache_t weights_cache,
+  xnn_operator_t* fully_connected_op_out);
+
 enum xnn_status xnn_reshape_fully_connected_nc_qd8_f32_qb4w(
   xnn_operator_t fully_connected_op,
   size_t batch_size,
@@ -4079,6 +4098,19 @@ enum xnn_status xnn_reshape_fully_connected_nc_qd8_f32_qb4w(
   pthreadpool_t threadpool);
 
 enum xnn_status xnn_setup_fully_connected_nc_qd8_f32_qb4w(
+  xnn_operator_t fully_connected_op,
+  const int8_t* input,
+  float* output,
+  void* workspace,
+  const struct xnn_quantization_params* quantization_params);
+
+enum xnn_status xnn_reshape_fully_connected_nc_qd8_f32_mqint8(
+  xnn_operator_t fully_connected_op,
+  size_t batch_size,
+  size_t* workspace_size,
+  pthreadpool_t threadpool);
+
+enum xnn_status xnn_setup_fully_connected_nc_qd8_f32_mqint8(
   xnn_operator_t fully_connected_op,
   const int8_t* input,
   float* output,
@@ -4796,6 +4828,11 @@ enum xnn_status xnn_setup_space_to_depth_nhwc_x8(
   xnn_operator_t space_to_depth_op,
   const void* input,
   void* output);
+
+// MatQSD mqint8: global mode switching for speculative decoding
+// mode=0: 4-bit (draft), mode=1: 8-bit (target), mode=-1: use per-op default
+void xnn_set_mqint8_global_mode(int mode);
+int xnn_get_mqint8_global_mode(void);
 
 #ifdef __cplusplus
 }  // extern "C"

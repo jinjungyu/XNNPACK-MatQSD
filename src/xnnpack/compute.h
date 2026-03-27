@@ -362,6 +362,7 @@ struct gemm_context {
     union xnn_qu8_conv_minmax_params qu8;
     struct xnn_f16_scaleminmax_params f16;
     struct xnn_f32_minmax_params f32;
+    struct xnn_f32_mqint8_minmax_params mqint8;
   } params;
   const struct xnn_pack_lh_config* packed_lh_config;
   // Whether to use the `dq_kernel` or not.

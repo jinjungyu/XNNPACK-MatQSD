@@ -2246,6 +2246,8 @@ static bool convert_gemm_to_qduint8(
     } else if (consumer_weights_type == xnn_datatype_qbint4) {
       original_config = xnn_init_qd8_f32_qb4w_gemm_config();
       unsigned_config = xnn_init_qdu8_f32_qb4w_gemm_config();
+    } else if (consumer_weights_type == xnn_datatype_mqint8) {
+      original_config = xnn_init_qd8_f32_mqint8_gemm_config();
     }
   } else if (input_datatype == xnn_datatype_fp16) {
     if (consumer_weights_type == xnn_datatype_qcint4) {

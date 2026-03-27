@@ -132,6 +132,21 @@ struct xnn_f32_qb4w_minmax_params {
   } scalar;
 };
 
+// MatQSD mqint8: dual-region packed layout for 4-bit/8-bit mode switching.
+// Per NR-block: [Region A (int8)] [Region B (nibble-packed)]
+struct xnn_f32_mqint8_minmax_params {
+  struct {
+    float min;
+    float max;
+    size_t blocksize;
+    int mode;                   // 0 = 4-bit, 1 = 8-bit
+    const void* lower_base;    // base of lower region (set in reshape)
+    size_t lower_per_nr;       // bytes per NR block in lower region
+    size_t four_bit_stride;    // w_stride for 4-bit NR blocks
+    const void* w_base;        // packed_w base (for NR index computation)
+  } scalar;
+};
+
 struct xnn_s8_minmax_params {
   struct {
     int32_t min;

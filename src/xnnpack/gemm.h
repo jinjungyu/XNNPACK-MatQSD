@@ -3932,6 +3932,21 @@ DECLARE_QD8_F32_QB4W_GEMM_MINMAX_UKERNEL_FUNCTION(
 DECLARE_QD8_F32_QB4W_GEMM_MINMAX_UKERNEL_FUNCTION(
     xnn_qd8_f32_qb4w_gemm_minmax_ukernel_4x4c8__sse41_ld64)
 
+// MatQSD mqint8 kernel declaration (uses mqint8 params with lower_offset)
+#define DECLARE_QD8_F32_MQINT8_GEMM_MINMAX_UKERNEL_FUNCTION(fn_name)   \
+  XNN_INTERNAL void fn_name(                                            \
+      size_t mr, size_t nr, size_t k, const int8_t* a, size_t a_stride, \
+      const void* w, float* c, size_t cm_stride, size_t cn_stride,      \
+      const struct xnn_f32_mqint8_minmax_params* params,                \
+      const struct xnn_qd8_quantization_params* quantization_params);
+
+DECLARE_QD8_F32_MQINT8_GEMM_MINMAX_UKERNEL_FUNCTION(
+    xnn_qd8_f32_mqint8_gemm_minmax_ukernel_1x16c4__neondot)
+DECLARE_QD8_F32_MQINT8_GEMM_MINMAX_UKERNEL_FUNCTION(
+    xnn_qd8_f32_mqint8_gemm_minmax_ukernel_1x16c8__neoni8mm)
+DECLARE_QD8_F32_MQINT8_GEMM_MINMAX_UKERNEL_FUNCTION(
+    xnn_qd8_f32_mqint8_gemm_minmax_ukernel_4x16c8__neoni8mm)
+
 size_t xnn_qp8_f32_qc4w_gemm_minmax_ukernel_1x64c4__neonsme2_get_mr();
 size_t xnn_qp8_f32_qc4w_gemm_minmax_ukernel_1x64c4__neonsme2_get_nr();
 size_t xnn_qp8_f32_qc4w_gemm_minmax_ukernel_16x64c4__neonsme2_get_mr();

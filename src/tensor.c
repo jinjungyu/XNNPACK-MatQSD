@@ -69,6 +69,7 @@ static enum xnn_status check_zero_point(
       }
       break;
     case xnn_datatype_quint8:
+    case xnn_datatype_mqint8:  // mqint8: zp=128 (uint8 range)
       if ((int32_t) (uint8_t) zero_point != zero_point) {
         xnn_log_error(
           "failed to create Quantized Dense Tensor value: invalid zero point %" PRId32" outside the [0, 255] range",
@@ -514,6 +515,7 @@ enum xnn_status xnn_define_blockwise_quantized_tensor_value_v2(
 
   switch (datatype) {
     case xnn_datatype_qbint4:
+    case xnn_datatype_mqint8:
       break;
     default:
       xnn_log_error("failed to create Blockwise Quantized Dense Tensor value: unsupported datatype %s (%d)",

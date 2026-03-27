@@ -11,6 +11,7 @@
 #include <math.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -1213,6 +1214,45 @@ enum xnn_status xnn_create_fully_connected_nc_qd8_f32_qb4w(
       fully_connected_op_out);
 }
 
+enum xnn_status xnn_create_fully_connected_nc_qd8_f32_mqint8(
+    size_t input_channels, size_t output_channels, size_t input_stride,
+    size_t output_stride, size_t block_size, uint8_t kernel_zero_point,
+    const uint16_t* kernel_scale, const void* kernel, const float* bias,
+    float output_min, float output_max, uint32_t flags,
+    xnn_weights_cache_t weights_cache, xnn_operator_t* fully_connected_op_out) {
+  // mqint8: single weight, dual-region nibble packing.
+  // Uses filter_is_nibble=true, planes=2 for correct k_stride (nibble-halved).
+  // Packer receives int8 weights, splits into upper/lower nibble regions internally.
+  const uint8_t nibble_zero_point = 8;
+  const struct xnn_gemm_config* gemm_config =
+      xnn_init_qd8_f32_mqint8_gemm_config();
+  enum xnn_status status = create_fully_connected_nc_qx8_f32_qb4w(
+      input_channels, output_channels, input_stride, output_stride, block_size,
+      nibble_zero_point, kernel_scale, kernel, bias, output_min, output_max,
+      flags, weights_cache, gemm_config,
+      xnn_operator_type_fully_connected_nc_qd8_f32_mqint8,
+      fully_connected_op_out);
+
+  if (status == xnn_status_success && *fully_connected_op_out != NULL) {
+    xnn_operator_t op = *fully_connected_op_out;
+
+    // New interleaved layout: kernel manages w pointer directly.
+    // No region_8bit/4bit_size needed — kernel computes from blocksize + NR.
+    op->params.f32_mqint8_minmax.scalar.min = op->params.f32_qb4w_minmax.scalar.min;
+    op->params.f32_mqint8_minmax.scalar.max = op->params.f32_qb4w_minmax.scalar.max;
+    op->params.f32_mqint8_minmax.scalar.blocksize = block_size;
+    // Mode from env: MQINT8_MODE=0 (4-bit) or 1 (8-bit, default)
+    const char* _mode_env = getenv("MQINT8_MODE");
+    op->params.f32_mqint8_minmax.scalar.mode = _mode_env ? atoi(_mode_env) : 1;
+    // lower_base, w_base, etc. set in reshape (when packed_w is available)
+    op->params.f32_mqint8_minmax.scalar.lower_base = NULL;
+    op->params.f32_mqint8_minmax.scalar.lower_per_nr = 0;
+    op->params.f32_mqint8_minmax.scalar.four_bit_stride = 0;
+    op->params.f32_mqint8_minmax.scalar.w_base = NULL;
+  }
+  return status;
+}
+
 enum xnn_status create_fully_connected_nc_qd8_f32_qb4w_f16_scales(
     size_t input_channels, size_t output_channels, size_t input_stride,
     size_t output_stride, size_t block_size, uint8_t kernel_zero_point,
@@ -2270,6 +2310,7 @@ static enum xnn_status reshape_fully_connected_nc(
       }
       break;
     case xnn_operator_type_fully_connected_nc_qd8_f32_qb4w:
+    case xnn_operator_type_fully_connected_nc_qd8_f32_mqint8:
     case xnn_operator_type_fully_connected_nc_qd8_f32_qc4w:
     case xnn_operator_type_fully_connected_nc_qd8_f32_qc8w:
       if (inline_lhs_packing) {
@@ -2731,6 +2772,65 @@ enum xnn_status xnn_reshape_fully_connected_nc_qd8_f32_qb4w(
       threadpool);
 }
 
+enum xnn_status xnn_reshape_fully_connected_nc_qd8_f32_mqint8(
+    xnn_operator_t fully_connected_op, size_t batch_size,
+    size_t* workspace_size, pthreadpool_t threadpool) {
+  enum xnn_status status = reshape_fully_connected_nc(
+      fully_connected_op, xnn_operator_type_fully_connected_nc_qd8_f32_mqint8,
+      batch_size,
+      XNN_LOG2_SIZEOF_INT8_T,
+      XNN_LOG2_SIZEOF_UINT8_T,
+      /*filter_is_nibble=*/true,
+      /*dynamic_quantization=*/true,
+      XNN_LOG2_SIZEOF_FLOAT,
+      &fully_connected_op->params.f32_mqint8_minmax,
+      sizeof(fully_connected_op->params.f32_mqint8_minmax), workspace_size,
+      threadpool);
+
+  if (status == xnn_status_success &&
+      fully_connected_op->state != xnn_run_state_skip) {
+    // Override w_stride for global region separation:
+    //   4-bit NR blocks are packed contiguously, lower data at the end.
+    //   w_stride = 4-bit-only stride (not full stride used for allocation).
+    const size_t block_size = fully_connected_op->params.f32_mqint8_minmax.scalar.blocksize;
+    const uint32_t nr = fully_connected_op->ukernel.gemm_ukernels->gemm.nr;
+    size_t input_channels = fully_connected_op->convolution_op->group_input_channels;
+    const uint32_t planes = fully_connected_op->ukernel.gemm_ukernels->gemm.kp;
+    input_channels = round_up_po2(input_channels, planes);
+    const size_t num_groups = input_channels / block_size;
+    const size_t upper_per_group = (block_size / 2) * nr;
+    const size_t scale_per_group = nr * sizeof(uint16_t);
+    const size_t vksum4_size = nr * sizeof(float);  // only vksum4 in 4-bit region
+    const size_t vksum8_size = nr * sizeof(float);  // vksum8 in lower region
+    const size_t bias_size = nr * sizeof(float);
+    const size_t four_bit_stride = vksum4_size
+        + num_groups * (upper_per_group + scale_per_group) + bias_size;
+    const size_t lower_per_nr = vksum8_size + num_groups * upper_per_group;
+    const size_t n_stride = round_up(
+        fully_connected_op->convolution_op->group_output_channels, nr);
+
+    struct gemm_op_context* ctx = fully_connected_op->dynamic_context.gemm;
+    // w_stride is per-OC (dispatch: packed_w + nr_block_start * w_stride)
+    ctx->gemm.w_stride = four_bit_stride / nr;
+
+    // Set lower region pointers in params (already memcpy'd into ctx)
+    const size_t num_nr_blocks = n_stride / nr;
+    struct xnn_f32_mqint8_minmax_params* p = &ctx->gemm.params.mqint8;
+    p->scalar.w_base = ctx->gemm.packed_w;
+    p->scalar.lower_base = (const int8_t*)ctx->gemm.packed_w
+        + num_nr_blocks * four_bit_stride;
+    p->scalar.lower_per_nr = lower_per_nr;
+    p->scalar.four_bit_stride = four_bit_stride;  // per NR block
+
+    // Apply global mode if set (for SD mode switching per forward)
+    int gmode = xnn_get_mqint8_global_mode();
+    if (gmode >= 0) {
+      p->scalar.mode = gmode;
+    }
+  }
+  return status;
+}
+
 enum xnn_status xnn_reshape_fully_connected_nc_qdu8_f32_qb4w(
     xnn_operator_t fully_connected_op, size_t batch_size,
     size_t* workspace_size, pthreadpool_t threadpool) {
@@ -3108,6 +3208,15 @@ enum xnn_status xnn_setup_fully_connected_nc_qd8_f32_qb4w(
       input, output, workspace, quantization_params);
 }
 
+enum xnn_status xnn_setup_fully_connected_nc_qd8_f32_mqint8(
+    xnn_operator_t fully_connected_op, const int8_t* input, float* output,
+    void* workspace,
+    const struct xnn_quantization_params* quantization_params) {
+  return setup_fully_connected_nc(
+      fully_connected_op, xnn_operator_type_fully_connected_nc_qd8_f32_mqint8,
+      input, output, workspace, quantization_params);
+}
+
 enum xnn_status xnn_setup_fully_connected_nc_qdu8_f32_qb4w(
     xnn_operator_t fully_connected_op, const int8_t* input, float* output,
     void* workspace,
@@ -3211,4 +3320,21 @@ enum xnn_status xnn_setup_fully_connected_nc_qu8(
   return setup_fully_connected_nc(
       fully_connected_op, xnn_operator_type_fully_connected_nc_qu8, input,
       output, /*workspace=*/NULL, /*quantization_params=*/NULL);
+}
+
+// MatQSD mqint8: runtime mode switching for speculative decoding
+void xnn_set_mqint8_mode(xnn_operator_t op, int mode) {
+  if (op != NULL &&
+      op->type == xnn_operator_type_fully_connected_nc_qd8_f32_mqint8) {
+    op->params.f32_mqint8_minmax.scalar.mode = mode;
+  }
+}
+
+// Global mode for SD: set before each forward(), applied during reshape
+static int xnn_mqint8_global_mode = -1;  // -1 = use per-op mode (env var)
+void xnn_set_mqint8_global_mode(int mode) {
+  xnn_mqint8_global_mode = mode;
+}
+int xnn_get_mqint8_global_mode(void) {
+  return xnn_mqint8_global_mode;
 }

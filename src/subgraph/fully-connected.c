@@ -56,6 +56,7 @@ enum fully_connected_op_type {
   fc_type_pf16_f16_f16_dynamic = 32,
   fc_type_pf32_f32_f32_dynamic = 33,
   fc_type_qs8_qs8_qc4w = 34,
+  fc_type_qd8_f32_mqint8 = 35,
 };
 
 enum fully_connected_op_type get_fully_connected_op_type(
@@ -171,6 +172,13 @@ enum fully_connected_op_type get_fully_connected_op_type(
               return fc_type_qdu8_f32_qb4w;
             case xnn_datatype_qpint8:
               return fc_type_qp8_f32_qb4w;
+            default:
+              XNN_UNREACHABLE;
+          }
+        case xnn_datatype_mqint8:
+          switch (input_datatype) {
+            case xnn_datatype_qdint8:
+              return fc_type_qd8_f32_mqint8;
             default:
               XNN_UNREACHABLE;
           }
@@ -463,6 +471,25 @@ static enum xnn_status create_fully_connected_operator(
               /*block_size=*/filter_value->quantization.block_size,
               /*kernel_zero_point=*/filter_value->quantization.zero_point,
               filter_value->quantization.blockwise_scale.fp16_scale,
+              kernel_data, bias_data, node->activation.output_min,
+              node->activation.output_max, node->flags, weights_cache,
+              fully_connected_op_ptr);
+          break;
+        default:
+          XNN_UNREACHABLE;
+      }
+      break;
+    case fc_type_qd8_f32_mqint8:
+      switch (filter_value->quantization.scale_type) {
+        case xnn_datatype_bf16:
+          status = xnn_create_fully_connected_nc_qd8_f32_mqint8(
+              input_channels, output_channels,
+              /*input_stride=*/input_channels,
+              /*output_stride=*/output_channels,
+              /*block_size=*/filter_value->quantization.block_size,
+              /*kernel_zero_point=*/filter_value->quantization.zero_point,
+              (const uint16_t*)
+                  filter_value->quantization.blockwise_scale.bf16_scale,
               kernel_data, bias_data, node->activation.output_min,
               node->activation.output_max, node->flags, weights_cache,
               fully_connected_op_ptr);
@@ -854,6 +881,10 @@ static enum xnn_status reshape_fully_connected_operator(
       status = xnn_reshape_fully_connected_nc_qd8_f16_qb4w(
           fully_connected_op, batch_size, &opdata->workspace_size, threadpool);
       break;
+    case xnn_operator_type_fully_connected_nc_qd8_f32_mqint8:
+      status = xnn_reshape_fully_connected_nc_qd8_f32_mqint8(
+          fully_connected_op, batch_size, &opdata->workspace_size, threadpool);
+      break;
     case xnn_operator_type_fully_connected_nc_qd8_f32_qb4w:
       status = xnn_reshape_fully_connected_nc_qd8_f32_qb4w(
           fully_connected_op, batch_size, &opdata->workspace_size, threadpool);
@@ -1072,6 +1103,17 @@ static enum xnn_status setup_fully_connected_operator(
           fully_connected_op, input_data, output_data, workspace,
           quantization_params);
     }
+    case xnn_operator_type_fully_connected_nc_qd8_f32_mqint8: {
+      const void* quantization_params =
+          input_value->quantization.dynamic_params;
+      void* workspace = opdata->workspace;
+      assert(kernel_data == NULL);
+      assert(bias_data == NULL);
+      assert(quantization_params != NULL || workspace != NULL);
+      return xnn_setup_fully_connected_nc_qd8_f32_mqint8(
+          fully_connected_op, input_data, output_data, workspace,
+          quantization_params);
+    }
     case xnn_operator_type_fully_connected_nc_qd8_f32_qb4w: {
       const void* quantization_params =
           input_value->quantization.dynamic_params;
@@ -1261,6 +1303,7 @@ static inline bool validate_datatypes_with_bias(
       }
       break;
     case xnn_datatype_qbint4:
+    case xnn_datatype_mqint8:
       if (input_datatype == xnn_datatype_qdint8 &&
           bias_datatype == xnn_datatype_fp32 &&
           output_datatype == xnn_datatype_fp32) {
@@ -1367,6 +1410,7 @@ static inline bool validate_datatypes_without_bias(
       }
       break;
     case xnn_datatype_qbint4:
+    case xnn_datatype_mqint8:
       if (input_datatype == xnn_datatype_qdint8 &&
           output_datatype == xnn_datatype_fp32) {
         return true;
@@ -1526,6 +1570,17 @@ enum xnn_status xnn_define_fully_connected(xnn_subgraph_t subgraph,
         return xnn_status_invalid_parameter;
       }
       break;
+    case xnn_datatype_mqint8:
+      if (kernel_value->quantization.zero_point != 128) {
+        xnn_log_error("failed to define %s operator with filter ID #%" PRIu32
+                      ": unsupported quantization zero point %" PRId32
+                      " for datatype %s, must be 128",
+                      xnn_node_type_to_string(xnn_node_type_fully_connected),
+                      filter_id, kernel_value->quantization.zero_point,
+                      xnn_datatype_to_string(kernel_value->datatype));
+        return xnn_status_invalid_parameter;
+      }
+      break;
     case xnn_datatype_qcint8:
       break;
     case xnn_datatype_qint8:
@@ -1566,7 +1621,8 @@ enum xnn_status xnn_define_fully_connected(xnn_subgraph_t subgraph,
   }
 
   const bool is_blockwise_quantized =
-      kernel_value->datatype == xnn_datatype_qbint4;
+      kernel_value->datatype == xnn_datatype_qbint4 ||
+      kernel_value->datatype == xnn_datatype_mqint8;
 
   if (is_blockwise_quantized) {
     // TODO: Unsupported features
